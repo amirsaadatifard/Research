@@ -30,6 +30,7 @@ public class MainForm : Form
 
     // سقف ایمنی برای تعداد صفحه‌های بررسی‌شده در هر نوبت جستجو.
     private const int MaxPages = 200;
+    private const int ProxyRotationInterval = 10;
 
     // ---- کنترل‌ها ----
     private readonly TextBox keywordBox = new();
@@ -39,12 +40,23 @@ public class MainForm : Form
     private readonly Button searchButton = new();
     private readonly ToolStripStatusLabel statusLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleRight };
     private readonly CheckBox privateBox = new();
+    private readonly CheckBox proxyModeBox = new();
+    private readonly Button fetchProxiesButton = new();
+    private readonly Label proxyStatusLabel = new();
+    private readonly ProxyManager proxyManager = new();
+    private readonly List<ProxyEndpoint> proxyPool = new();
 
     private WebView2? webView;
     private CancellationTokenSource? huntCts;
     private bool suppressToggle;
+    private bool suppressProxyToggle;
     private bool isPrivateMode;
+    private bool isProxyModeActive;
+    private bool isFetchingProxies;
     private bool isInitializing;
+    private int currentProxyIndex;
+    private int searchesOnCurrentProxy;
+    private string? activeProxyAddress;
 
     public MainForm()
     {
@@ -78,7 +90,7 @@ public class MainForm : Form
         var header = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 128,
+            Height = 174,
             BackColor = Bg,
             Padding = new Padding(14, 10, 14, 8),
         };
@@ -90,11 +102,12 @@ public class MainForm : Form
             Padding = new Padding(14, 6, 14, 6),
             RightToLeft = RightToLeft.Yes,
             ColumnCount = 1,
-            RowCount = 2,
+            RowCount = 3,
         };
         card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        card.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        card.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        card.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+        card.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+        card.RowStyles.Add(new RowStyle(SizeType.Percent, 33.34f));
 
         // ردیف اول: کلمه جستجو و سایت هدف
         var queryRow = NewRow(4);
@@ -187,8 +200,45 @@ public class MainForm : Form
         optionsRow.Controls.Add(privateBox, 4, 0);
         optionsRow.Controls.Add(searchButton, 6, 0);
 
+        var proxyRow = NewRow(3);
+        proxyRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        proxyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+        proxyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        proxyModeBox.Text = "استفاده از پروکسی";
+        proxyModeBox.AutoSize = true;
+        proxyModeBox.Anchor = AnchorStyles.None;
+        proxyModeBox.Font = LabelFont;
+        proxyModeBox.ForeColor = TextDark;
+        proxyModeBox.Cursor = Cursors.Hand;
+        var proxyTip = new ToolTip();
+        proxyTip.SetToolTip(proxyModeBox,
+            "پروکسی‌های عمومی ممکن است کند یا ناامن باشند. هرگز برای حساب‌ها یا اطلاعات حساس استفاده نکنید. " +
+            "پروکسی فعال پس از هر ۱۰ نوبت جستجو عوض می‌شود.");
+        proxyModeBox.CheckedChanged += async (_, _) => await ChangeProxyModeAsync();
+
+        StylePrimary(fetchProxiesButton, "دریافت و بررسی");
+        fetchProxiesButton.BackColor = Color.FromArgb(75, 85, 99);
+        fetchProxiesButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(55, 65, 81);
+        fetchProxiesButton.Click += async (_, _) => await LoadAndTestProxiesAsync();
+        proxyTip.SetToolTip(fetchProxiesButton,
+            $"دریافت فهرست عمومی از {ProxyManager.SourceUrl} و آزمایش دسترسی HTTPS هر پروکسی.");
+
+        proxyStatusLabel.Text = "پروکسی‌ها هنوز دریافت نشده‌اند";
+        proxyStatusLabel.AutoEllipsis = true;
+        proxyStatusLabel.Dock = DockStyle.Fill;
+        proxyStatusLabel.TextAlign = ContentAlignment.MiddleRight;
+        proxyStatusLabel.Font = UiFont;
+        proxyStatusLabel.ForeColor = TextMuted;
+        proxyStatusLabel.Margin = new Padding(8, 0, 8, 0);
+
+        proxyRow.Controls.Add(proxyModeBox, 0, 0);
+        proxyRow.Controls.Add(fetchProxiesButton, 1, 0);
+        proxyRow.Controls.Add(proxyStatusLabel, 2, 0);
+
         card.Controls.Add(queryRow, 0, 0);
         card.Controls.Add(optionsRow, 0, 1);
+        card.Controls.Add(proxyRow, 0, 2);
         header.Controls.Add(card);
         return header;
     }
@@ -283,6 +333,8 @@ public class MainForm : Form
         engineBox.Enabled = enabled;
         repetitionCountBox.Enabled = enabled;
         privateBox.Enabled = enabled;
+        proxyModeBox.Enabled = enabled && proxyPool.Count > 0;
+        fetchProxiesButton.Enabled = enabled && !proxyModeBox.Checked;
     }
 
     // =====================================================================
@@ -346,7 +398,7 @@ public class MainForm : Form
     private async Task ChangePrivateModeAsync()
     {
         if (suppressToggle || isInitializing) return;
-        if (huntCts != null)
+        if (huntCts != null || isFetchingProxies)
         {
             suppressToggle = true;
             privateBox.Checked = isPrivateMode;
@@ -362,7 +414,10 @@ public class MainForm : Form
 
         try
         {
-            await InitWebViewAsync(requestedMode);
+            await InitWebViewAsync(
+                requestedMode,
+                resetCurrent: true,
+                proxyAddress: GetSelectedProxyAddress());
             SetStatus(requestedMode ? "حالت خصوصی (InPrivate) فعال است" : "حالت عادی فعال است");
         }
         catch (Exception ex)
@@ -381,23 +436,160 @@ public class MainForm : Form
     }
 
     // =====================================================================
+    //  دریافت و مدیریت پروکسی‌ها
+    // =====================================================================
+    private async Task LoadAndTestProxiesAsync()
+    {
+        if (isFetchingProxies || huntCts != null || proxyModeBox.Checked) return;
+
+        isFetchingProxies = true;
+        SetInputControlsEnabled(false);
+        searchButton.Enabled = false;
+        SetStatus("در حال دریافت و آزمایش پروکسی‌های عمومی...");
+
+        try
+        {
+            var progress = new Progress<string>(message =>
+            {
+                if (IsDisposed || Disposing) return;
+                proxyStatusLabel.Text = message;
+                SetStatus(message);
+            });
+            var discovered = await proxyManager.FetchAndTestAsync(progress, CancellationToken.None);
+
+            if (discovered.Count == 0)
+            {
+                if (proxyPool.Count == 0)
+                {
+                    proxyStatusLabel.Text = "پروکسی قابل استفاده‌ای پیدا نشد";
+                    SetStatus("در نمونه‌ی دریافت‌شده پروکسی قابل استفاده‌ای پیدا نشد؛ بعداً دوباره امتحان کنید");
+                }
+                else
+                {
+                    proxyStatusLabel.Text = $"آزمایش جدید پروکسی موفق نبود؛ فهرست قبلی ({proxyPool.Count}) حفظ شد";
+                    SetStatus("پروکسی جدیدی پاسخ نداد؛ فهرست قبلی دست‌نخورده باقی ماند");
+                }
+                return;
+            }
+
+            proxyPool.Clear();
+            proxyPool.AddRange(discovered);
+            currentProxyIndex = 0;
+            searchesOnCurrentProxy = 0;
+            proxyStatusLabel.Text = $"{proxyPool.Count} پروکسی HTTPS سالم از TheSpeedX/GitHub؛ مرتب‌شده بر اساس سرعت";
+            SetStatus($"{proxyPool.Count} پروکسی از منبع عمومی دریافت و آزمایش شد");
+        }
+        catch (Exception ex)
+        {
+            proxyStatusLabel.Text = "دریافت یا آزمایش پروکسی ناموفق بود";
+            SetStatus($"دریافت یا آزمایش پروکسی ناموفق بود: {ex.Message}");
+        }
+        finally
+        {
+            isFetchingProxies = false;
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+                searchButton.Enabled = true;
+        }
+    }
+
+    private async Task ChangeProxyModeAsync()
+    {
+        if (suppressProxyToggle || isInitializing) return;
+
+        var requestedMode = proxyModeBox.Checked;
+        if (huntCts != null || isFetchingProxies)
+        {
+            suppressProxyToggle = true;
+            proxyModeBox.Checked = isProxyModeActive;
+            suppressProxyToggle = false;
+            return;
+        }
+        if (requestedMode && proxyPool.Count == 0)
+        {
+            suppressProxyToggle = true;
+            proxyModeBox.Checked = false;
+            suppressProxyToggle = false;
+            SetStatus("ابتدا «دریافت و بررسی» را بزنید تا پروکسی قابل استفاده پیدا شود");
+            return;
+        }
+
+        var previousMode = isProxyModeActive;
+        SetInputControlsEnabled(false);
+        searchButton.Enabled = false;
+        SetStatus(requestedMode ? "در حال فعال‌سازی پروکسی..." : "در حال غیرفعال‌سازی پروکسی...");
+
+        try
+        {
+            var address = requestedMode ? proxyPool[currentProxyIndex].Address : null;
+            await InitWebViewAsync(isPrivateMode, resetCurrent: true, proxyAddress: address);
+            isProxyModeActive = requestedMode;
+            if (requestedMode)
+                proxyStatusLabel.Text = $"فعال: {address} — تعویض خودکار هر {ProxyRotationInterval} جستجو";
+            else if (proxyPool.Count > 0)
+                proxyStatusLabel.Text = $"{proxyPool.Count} پروکسی سالم از TheSpeedX/GitHub؛ استفاده خاموش است";
+            SetStatus(requestedMode
+                ? $"پروکسی فعال شد: {address} — تعویض خودکار هر {ProxyRotationInterval} جستجو"
+                : "پروکسی غیرفعال شد؛ جستجو مستقیم انجام می‌شود");
+        }
+        catch (Exception ex)
+        {
+            suppressProxyToggle = true;
+            proxyModeBox.Checked = previousMode;
+            suppressProxyToggle = false;
+            SetStatus($"تغییر حالت پروکسی ناموفق بود: {ex.Message}");
+        }
+        finally
+        {
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+                searchButton.Enabled = true;
+        }
+    }
+
+    private string? GetSelectedProxyAddress() =>
+        isProxyModeActive && proxyPool.Count > 0
+            ? proxyPool[Math.Clamp(currentProxyIndex, 0, proxyPool.Count - 1)].Address
+            : null;
+
+    private static string GetProxyUserDataFolder(string proxyAddress)
+    {
+        var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(root)) root = Path.GetTempPath();
+        var profileName = proxyAddress.Replace(':', '_');
+        return Path.Combine(root, "MiniBrowser", "ProxyProfiles", profileName);
+    }
+
+    // =====================================================================
     //  ساخت WebView2
     // =====================================================================
-    private async Task InitWebViewAsync(bool inPrivate, bool resetCurrent = false)
+    private async Task InitWebViewAsync(bool inPrivate, bool resetCurrent = false, string? proxyAddress = null)
     {
         var old = webView;
         if (resetCurrent)
         {
-            // در حالت خصوصی، کنترل قبلی قبل از ساخت نشست بعدی بسته می‌شود تا داده‌ای بین
-            // دو نوبت جستجو باقی نماند.
+            // هنگام تعویض پروکسی یا ساخت نشست خصوصی تازه، کنترل قبلی بسته می‌شود.
             DisposeWebView(old);
             webView = null;
+            activeProxyAddress = null;
         }
 
         var fresh = new WebView2 { Dock = DockStyle.Fill };
         try
         {
-            var environment = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync();
+            var environmentOptions = new Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions();
+            string? userDataFolder = null;
+            if (proxyAddress != null)
+            {
+                environmentOptions.AdditionalBrowserArguments = $"--proxy-server=http://{proxyAddress}";
+                userDataFolder = GetProxyUserDataFolder(proxyAddress);
+                Directory.CreateDirectory(userDataFolder);
+            }
+
+            var environment = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(
+                null,
+                userDataFolder,
+                environmentOptions);
             var options = environment.CreateCoreWebView2ControllerOptions();
             options.IsInPrivateModeEnabled = inPrivate;
 
@@ -407,6 +599,7 @@ public class MainForm : Form
 
             webView = fresh;
             isPrivateMode = inPrivate;
+            activeProxyAddress = proxyAddress;
             if (!resetCurrent)
                 DisposeWebView(old);
         }
@@ -414,7 +607,10 @@ public class MainForm : Form
         {
             DisposeWebView(fresh);
             if (resetCurrent)
+            {
                 webView = null;
+                activeProxyAddress = null;
+            }
             throw;
         }
     }
@@ -431,7 +627,7 @@ public class MainForm : Form
     // =====================================================================
     private async Task StartSearchAsync()
     {
-        if (huntCts != null) return;
+        if (huntCts != null || isFetchingProxies) return;
 
         var keyword = keywordBox.Text.Trim();
         var site = siteBox.Text.Trim();
@@ -444,6 +640,11 @@ public class MainForm : Form
             repetitions < BigInteger.One)
         {
             SetStatus("تعداد تکرار باید یک عدد صحیح مثبت باشد");
+            return;
+        }
+        if (proxyModeBox.Checked && proxyPool.Count == 0)
+        {
+            SetStatus("حالت پروکسی فعال است اما پروکسی قابل استفاده‌ای وجود ندارد");
             return;
         }
         if (webView?.CoreWebView2 == null)
@@ -468,6 +669,7 @@ public class MainForm : Form
 
         var engine = Engines[engineBox.SelectedIndex];
         var usePrivateMode = privateBox.Checked;
+        var useProxy = proxyModeBox.Checked;
         var cts = new CancellationTokenSource();
         huntCts = cts;
         var ct = cts.Token;
@@ -487,13 +689,40 @@ public class MainForm : Form
             {
                 ct.ThrowIfCancellationRequested();
 
-                if (usePrivateMode)
+                if (useProxy && searchesOnCurrentProxy >= ProxyRotationInterval)
                 {
-                    SetStatus($"در حال پاک‌سازی نشست خصوصی برای جستجوی {attempt} از {repetitions}...");
-                    await InitWebViewAsync(inPrivate: true, resetCurrent: true);
+                    searchesOnCurrentProxy = 0;
+                    if (proxyPool.Count > 1)
+                    {
+                        currentProxyIndex = (currentProxyIndex + 1) % proxyPool.Count;
+                        var nextProxy = proxyPool[currentProxyIndex];
+                        proxyStatusLabel.Text = $"فعال: {nextProxy.Address} — تعویض در {ProxyRotationInterval} جستجوی بعدی";
+                        SetStatus($"در حال تعویض پروکسی به {nextProxy.Address} برای جستجوی {attempt} از {repetitions}...");
+                    }
+                    else
+                    {
+                        SetStatus("فقط یک پروکسی قابل استفاده است؛ همان پروکسی برای ادامه حفظ می‌شود");
+                    }
+                }
+
+                var requestedProxy = useProxy ? proxyPool[currentProxyIndex].Address : null;
+                var proxyChanged = !string.Equals(activeProxyAddress, requestedProxy, StringComparison.Ordinal);
+                if (usePrivateMode || proxyChanged)
+                {
+                    if (usePrivateMode)
+                        SetStatus($"در حال آماده‌سازی نشست خصوصی برای جستجوی {attempt} از {repetitions}...");
+                    else
+                        SetStatus(requestedProxy == null
+                            ? "در حال آماده‌سازی اتصال مستقیم..."
+                            : $"در حال آماده‌سازی اتصال از پروکسی {requestedProxy}...");
+                    await InitWebViewAsync(
+                        inPrivate: usePrivateMode,
+                        resetCurrent: true,
+                        proxyAddress: requestedProxy);
                 }
                 ct.ThrowIfCancellationRequested();
 
+                if (useProxy) searchesOnCurrentProxy++;
                 var result = await RunSearchAttemptAsync(keyword, site, engine, attempt, repetitions, ct);
                 ct.ThrowIfCancellationRequested();
                 completed = attempt;
