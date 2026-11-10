@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Numerics;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -26,15 +28,14 @@ public class MainForm : Form
         new("DuckDuckGo", (q, p) => $"https://duckduckgo.com/?q={q}"),
     };
 
-    // سقف ایمنی برای هر نوبت جستجو و تعداد دفعات تکرار
+    // سقف ایمنی برای تعداد صفحه‌های بررسی‌شده در هر نوبت جستجو.
     private const int MaxPages = 200;
-    private const int MaxSearchRepetitions = 100;
 
     // ---- کنترل‌ها ----
     private readonly TextBox keywordBox = new();
     private readonly TextBox siteBox = new();
     private readonly ComboBox engineBox = new();
-    private readonly NumericUpDown repetitionCountBox = new();
+    private readonly TextBox repetitionCountBox = new();
     private readonly Button searchButton = new();
     private readonly ToolStripStatusLabel statusLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleRight };
     private readonly CheckBox privateBox = new();
@@ -134,19 +135,23 @@ public class MainForm : Form
         foreach (var engine in Engines) engineBox.Items.Add(engine.Name);
         engineBox.SelectedIndex = 0;
 
-        repetitionCountBox.Minimum = 1;
-        repetitionCountBox.Maximum = MaxSearchRepetitions;
-        repetitionCountBox.Value = 1;
-        repetitionCountBox.DecimalPlaces = 0;
-        repetitionCountBox.Increment = 1;
-        repetitionCountBox.ThousandsSeparator = false;
-        repetitionCountBox.TextAlign = HorizontalAlignment.Center;
+        repetitionCountBox.Text = "1";
+        repetitionCountBox.BorderStyle = BorderStyle.FixedSingle;
+        repetitionCountBox.ForeColor = TextDark;
         repetitionCountBox.Font = new Font("Segoe UI", 11f);
-        repetitionCountBox.Anchor = AnchorStyles.None;
-        repetitionCountBox.Margin = new Padding(4, 4, 4, 4);
+        repetitionCountBox.TextAlign = HorizontalAlignment.Center;
+        repetitionCountBox.RightToLeft = RightToLeft.No;
+        repetitionCountBox.Dock = DockStyle.Fill;
+        repetitionCountBox.Margin = new Padding(4, 5, 4, 5);
+        repetitionCountBox.KeyPress += (_, e) =>
+        {
+            if (!char.IsControl(e.KeyChar) && char.GetUnicodeCategory(e.KeyChar) != UnicodeCategory.DecimalDigitNumber)
+                e.Handled = true;
+        };
+        repetitionCountBox.TextChanged += (_, _) => NormalizeRepetitionDigits();
         repetitionCountBox.KeyDown += (_, e) => OnEnter(e, () => _ = StartSearchAsync());
         var repeatTip = new ToolTip();
-        repeatTip.SetToolTip(repetitionCountBox, $"تعداد اجرای کامل جستجو؛ فقط عدد صحیح از ۱ تا {MaxSearchRepetitions} پذیرفته می‌شود.");
+        repeatTip.SetToolTip(repetitionCountBox, "تعداد اجرای کامل جستجو؛ یک عدد صحیح مثبت وارد کنید. سقف تکرار از پیش تعیین نشده است.");
 
         privateBox.Text = "خصوصی";
         privateBox.AutoSize = true;
@@ -240,6 +245,30 @@ public class MainForm : Form
         action();
     }
 
+    private void NormalizeRepetitionDigits()
+    {
+        var original = repetitionCountBox.Text;
+        var normalized = new StringBuilder(original.Length);
+        foreach (var character in original)
+        {
+            if (character is >= '0' and <= '9')
+            {
+                normalized.Append(character);
+            }
+            else if (char.GetUnicodeCategory(character) == UnicodeCategory.DecimalDigitNumber)
+            {
+                normalized.Append((char)('0' + (int)char.GetNumericValue(character)));
+            }
+        }
+
+        var digits = normalized.ToString();
+        if (digits == original) return;
+
+        var cursor = repetitionCountBox.SelectionStart;
+        repetitionCountBox.Text = digits;
+        repetitionCountBox.SelectionStart = Math.Min(cursor, digits.Length);
+    }
+
     private void SetStatus(string text)
     {
         if (!IsDisposed && !Disposing)
@@ -295,11 +324,10 @@ public class MainForm : Form
         }
 
         var repeatArgument = Arg("--repeat");
-        if (int.TryParse(repeatArgument, NumberStyles.None, CultureInfo.InvariantCulture, out var requestedCount) &&
-            requestedCount >= (int)repetitionCountBox.Minimum &&
-            requestedCount <= (int)repetitionCountBox.Maximum)
+        if (BigInteger.TryParse(repeatArgument, NumberStyles.None, CultureInfo.InvariantCulture, out var requestedCount) &&
+            requestedCount >= BigInteger.One)
         {
-            repetitionCountBox.Value = requestedCount;
+            repetitionCountBox.Text = requestedCount.ToString(CultureInfo.InvariantCulture);
         }
 
         // اجرای خودکار از خط فرمان: MiniBrowser.exe --keyword اقیانوس --site wikipedia.org --repeat 3
@@ -412,6 +440,12 @@ public class MainForm : Form
             SetStatus("لطفاً کلمه جستجو را وارد کنید");
             return;
         }
+        if (!BigInteger.TryParse(repetitionCountBox.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var repetitions) ||
+            repetitions < BigInteger.One)
+        {
+            SetStatus("تعداد تکرار باید یک عدد صحیح مثبت باشد");
+            return;
+        }
         if (webView?.CoreWebView2 == null)
         {
             SetStatus("مرورگر هنوز آماده نیست");
@@ -433,12 +467,11 @@ public class MainForm : Form
         }
 
         var engine = Engines[engineBox.SelectedIndex];
-        var repetitions = (int)repetitionCountBox.Value;
         var usePrivateMode = privateBox.Checked;
         var cts = new CancellationTokenSource();
         huntCts = cts;
         var ct = cts.Token;
-        var completed = 0;
+        var completed = BigInteger.Zero;
         var aborted = false;
         var lastSummary = "";
 
@@ -450,7 +483,7 @@ public class MainForm : Form
 
         try
         {
-            for (var attempt = 1; attempt <= repetitions; attempt++)
+            for (var attempt = BigInteger.One; attempt <= repetitions; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
 
@@ -506,8 +539,8 @@ public class MainForm : Form
         string keyword,
         string site,
         Engine engine,
-        int attempt,
-        int repetitions,
+        BigInteger attempt,
+        BigInteger repetitions,
         CancellationToken ct)
     {
         var prefix = $"جستجوی {attempt} از {repetitions}";
