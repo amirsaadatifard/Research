@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Numerics;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -25,20 +28,35 @@ public class MainForm : Form
         new("DuckDuckGo", (q, p) => $"https://duckduckgo.com/?q={q}"),
     };
 
-    // سقف ایمنی؛ عملاً تا آخرین صفحه نتایج می‌گردد (موتورها معمولاً بعد از چند ده صفحه نتیجه نمی‌دهند)
+    // سقف ایمنی برای تعداد صفحه‌های بررسی‌شده در هر نوبت جستجو.
     private const int MaxPages = 200;
+    private const int ProxyRotationInterval = 10;
 
     // ---- کنترل‌ها ----
     private readonly TextBox keywordBox = new();
     private readonly TextBox siteBox = new();
     private readonly ComboBox engineBox = new();
+    private readonly TextBox repetitionCountBox = new();
     private readonly Button searchButton = new();
     private readonly ToolStripStatusLabel statusLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleRight };
     private readonly CheckBox privateBox = new();
-    private WebView2 webView = new();
+    private readonly CheckBox proxyModeBox = new();
+    private readonly Button fetchProxiesButton = new();
+    private readonly Label proxyStatusLabel = new();
+    private readonly ProxyManager proxyManager = new();
+    private readonly List<ProxyEndpoint> proxyPool = new();
 
+    private WebView2? webView;
     private CancellationTokenSource? huntCts;
     private bool suppressToggle;
+    private bool suppressProxyToggle;
+    private bool isPrivateMode;
+    private bool isProxyModeActive;
+    private bool isFetchingProxies;
+    private bool isInitializing;
+    private int currentProxyIndex;
+    private int searchesOnCurrentProxy;
+    private string? activeProxyAddress;
 
     public MainForm()
     {
@@ -56,31 +74,12 @@ public class MainForm : Form
         statusLabel.Text = "آماده";
         status.Items.Add(statusLabel);
 
-        // ترتیب اضافه شدن: آخرین Dock بالاتر/بیرونی‌تر قرار می‌گیرد
+        // ترتیب اضافه شدن: نوار وضعیت پایین و هدر بالا قرار می‌گیرد.
         Controls.Add(status);
         Controls.Add(header);
 
-        Load += async (_, _) =>
-        {
-            var startPrivate = Environment.GetCommandLineArgs().Contains("--private");
-            suppressToggle = true; privateBox.Checked = startPrivate; suppressToggle = false;
-            await InitWebViewAsync(startPrivate);
-
-            // اجرای خودکار از خط فرمان: MiniBrowser.exe --keyword اقیانوس --site wikipedia.org
-            var args = Environment.GetCommandLineArgs();
-            string? Arg(string name)
-            {
-                var i = Array.IndexOf(args, name);
-                return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
-            }
-            var kw = Arg("--keyword");
-            if (kw != null)
-            {
-                keywordBox.Text = kw;
-                siteBox.Text = Arg("--site") ?? "";
-                await StartSearchAsync();
-            }
-        };
+        FormClosing += (_, _) => huntCts?.Cancel();
+        Load += async (_, _) => await InitializeApplicationAsync();
     }
 
     // =====================================================================
@@ -91,32 +90,31 @@ public class MainForm : Form
         var header = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 76,
+            Height = 174,
             BackColor = Bg,
-            Padding = new Padding(14, 12, 14, 8),
+            Padding = new Padding(14, 10, 14, 8),
         };
 
         var card = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             BackColor = Card,
-            Padding = new Padding(14, 10, 14, 10),
+            Padding = new Padding(14, 6, 14, 6),
             RightToLeft = RightToLeft.Yes,
             ColumnCount = 1,
-            RowCount = 1,
+            RowCount = 3,
         };
-        card.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        card.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+        card.RowStyles.Add(new RowStyle(SizeType.Percent, 33.33f));
+        card.RowStyles.Add(new RowStyle(SizeType.Percent, 33.34f));
 
-        // ----- ردیف جستجو: کلمه جستجو + سایت هدف + موتور + دکمه -----
-        var row2 = NewRow(7);
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        row2.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        // ردیف اول: کلمه جستجو و سایت هدف
+        var queryRow = NewRow(4);
+        queryRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        queryRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        queryRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        queryRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
         StyleInput(keywordBox);
         keywordBox.RightToLeft = RightToLeft.Yes; // نوشتن فارسی راحت‌تر باشد
@@ -125,48 +123,122 @@ public class MainForm : Form
 
         StyleInput(siteBox);
         siteBox.PlaceholderText = "wikipedia.org";
-        new ToolTip().SetToolTip(siteBox, "رجکس آدرس سایت هدف. اگر خالی باشد فقط نتایج جستجو نمایش داده می‌شود.");
+        new ToolTip().SetToolTip(siteBox, "الگوی رجکس آدرس سایت هدف. اگر خالی باشد فقط صفحه نتایج جستجو باز می‌شود.");
         siteBox.KeyDown += (_, e) => OnEnter(e, () => _ = StartSearchAsync());
+
+        queryRow.Controls.Add(NewLabel("کلمه جستجو"), 0, 0);
+        queryRow.Controls.Add(keywordBox, 1, 0);
+        queryRow.Controls.Add(NewLabel("سایت هدف"), 2, 0);
+        queryRow.Controls.Add(siteBox, 3, 0);
+
+        // ردیف دوم: موتور، تعداد تکرار، حالت خصوصی و دکمه اجرا
+        var optionsRow = NewRow(7);
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        optionsRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
 
         engineBox.DropDownStyle = ComboBoxStyle.DropDownList;
         engineBox.Font = new Font("Segoe UI", 11f);
         engineBox.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-        engineBox.Margin = new Padding(4, 3, 4, 3);
-        foreach (var e in Engines) engineBox.Items.Add(e.Name);
+        engineBox.Margin = new Padding(4, 4, 4, 4);
+        foreach (var engine in Engines) engineBox.Items.Add(engine.Name);
         engineBox.SelectedIndex = 0;
 
-        StylePrimary(searchButton, "جستجو و باز کردن");
-        searchButton.Click += (_, _) =>
+        repetitionCountBox.Text = "1";
+        repetitionCountBox.BorderStyle = BorderStyle.FixedSingle;
+        repetitionCountBox.ForeColor = TextDark;
+        repetitionCountBox.Font = new Font("Segoe UI", 11f);
+        repetitionCountBox.TextAlign = HorizontalAlignment.Center;
+        repetitionCountBox.RightToLeft = RightToLeft.No;
+        repetitionCountBox.Dock = DockStyle.Fill;
+        repetitionCountBox.Margin = new Padding(4, 5, 4, 5);
+        repetitionCountBox.KeyPress += (_, e) =>
         {
-            if (huntCts != null) huntCts.Cancel();
-            else _ = StartSearchAsync();
+            if (!char.IsControl(e.KeyChar) && char.GetUnicodeCategory(e.KeyChar) != UnicodeCategory.DecimalDigitNumber)
+                e.Handled = true;
         };
+        repetitionCountBox.TextChanged += (_, _) => NormalizeRepetitionDigits();
+        repetitionCountBox.KeyDown += (_, e) => OnEnter(e, () => _ = StartSearchAsync());
+        var repeatTip = new ToolTip();
+        repeatTip.SetToolTip(repetitionCountBox, "تعداد اجرای کامل جستجو؛ یک عدد صحیح مثبت وارد کنید. سقف تکرار از پیش تعیین نشده است.");
 
-        row2.Controls.Add(NewLabel("کلمه جستجو"), 0, 0);
-        row2.Controls.Add(keywordBox, 1, 0);
-        row2.Controls.Add(NewLabel("سایت هدف"), 2, 0);
-        row2.Controls.Add(siteBox, 3, 0);
-        row2.Controls.Add(engineBox, 4, 0);
         privateBox.Text = "خصوصی";
         privateBox.AutoSize = true;
         privateBox.Anchor = AnchorStyles.None;
         privateBox.Font = LabelFont;
         privateBox.ForeColor = TextDark;
         privateBox.Cursor = Cursors.Hand;
-        new ToolTip().SetToolTip(privateBox, "مرور InPrivate: کوکی، تاریخچه و کش ذخیره نمی‌شود (آیپی تغییر نمی‌کند)");
-        privateBox.CheckedChanged += async (_, _) =>
+        var privateTip = new ToolTip();
+        privateTip.SetToolTip(privateBox,
+            "حالت InPrivate؛ کوکی، تاریخچه و کش ذخیره نمی‌شود و آی‌پی را تغییر نمی‌دهد. " +
+            "در این حالت پیش از هر نوبت جستجو، نشست مرورگر از نو ساخته می‌شود.");
+        privateBox.CheckedChanged += async (_, _) => await ChangePrivateModeAsync();
+
+        StylePrimary(searchButton, "جستجو و باز کردن");
+        searchButton.Click += (_, _) =>
         {
-            if (suppressToggle) return;
-            huntCts?.Cancel();
-            SetStatus(privateBox.Checked ? "در حال فعال‌سازی حالت خصوصی..." : "در حال برگشت به حالت عادی...");
-            await InitWebViewAsync(privateBox.Checked);
-            SetStatus(privateBox.Checked ? "حالت خصوصی (InPrivate) فعال است" : "حالت عادی");
+            if (huntCts is { } currentSearch)
+            {
+                searchButton.Text = "در حال توقف...";
+                searchButton.Enabled = false;
+                currentSearch.Cancel();
+            }
+            else
+            {
+                _ = StartSearchAsync();
+            }
         };
 
-        row2.Controls.Add(privateBox, 5, 0);
-        row2.Controls.Add(searchButton, 6, 0);
+        optionsRow.Controls.Add(NewLabel("موتور"), 0, 0);
+        optionsRow.Controls.Add(engineBox, 1, 0);
+        optionsRow.Controls.Add(NewLabel("تعداد تکرار"), 2, 0);
+        optionsRow.Controls.Add(repetitionCountBox, 3, 0);
+        optionsRow.Controls.Add(privateBox, 4, 0);
+        optionsRow.Controls.Add(searchButton, 6, 0);
 
-        card.Controls.Add(row2, 0, 0);
+        var proxyRow = NewRow(3);
+        proxyRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        proxyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 160));
+        proxyRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        proxyModeBox.Text = "استفاده از پروکسی";
+        proxyModeBox.AutoSize = true;
+        proxyModeBox.Anchor = AnchorStyles.None;
+        proxyModeBox.Font = LabelFont;
+        proxyModeBox.ForeColor = TextDark;
+        proxyModeBox.Cursor = Cursors.Hand;
+        var proxyTip = new ToolTip();
+        proxyTip.SetToolTip(proxyModeBox,
+            "پروکسی‌های عمومی ممکن است کند یا ناامن باشند. هرگز برای حساب‌ها یا اطلاعات حساس استفاده نکنید. " +
+            "پروکسی فعال پس از هر ۱۰ نوبت جستجو عوض می‌شود.");
+        proxyModeBox.CheckedChanged += async (_, _) => await ChangeProxyModeAsync();
+
+        StylePrimary(fetchProxiesButton, "دریافت و بررسی");
+        fetchProxiesButton.BackColor = Color.FromArgb(75, 85, 99);
+        fetchProxiesButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(55, 65, 81);
+        fetchProxiesButton.Click += async (_, _) => await LoadAndTestProxiesAsync();
+        proxyTip.SetToolTip(fetchProxiesButton,
+            $"دریافت فهرست عمومی از {ProxyManager.SourceUrl} و آزمایش دسترسی HTTPS هر پروکسی.");
+
+        proxyStatusLabel.Text = "پروکسی‌ها هنوز دریافت نشده‌اند";
+        proxyStatusLabel.AutoEllipsis = true;
+        proxyStatusLabel.Dock = DockStyle.Fill;
+        proxyStatusLabel.TextAlign = ContentAlignment.MiddleRight;
+        proxyStatusLabel.Font = UiFont;
+        proxyStatusLabel.ForeColor = TextMuted;
+        proxyStatusLabel.Margin = new Padding(8, 0, 8, 0);
+
+        proxyRow.Controls.Add(proxyModeBox, 0, 0);
+        proxyRow.Controls.Add(fetchProxiesButton, 1, 0);
+        proxyRow.Controls.Add(proxyStatusLabel, 2, 0);
+
+        card.Controls.Add(queryRow, 0, 0);
+        card.Controls.Add(optionsRow, 0, 1);
+        card.Controls.Add(proxyRow, 0, 2);
         header.Controls.Add(card);
         return header;
     }
@@ -192,28 +264,28 @@ public class MainForm : Form
         Margin = new Padding(8, 0, 8, 0),
     };
 
-    private static void StyleInput(TextBox t)
+    private static void StyleInput(TextBox textBox)
     {
-        t.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-        t.Font = new Font("Segoe UI", 11f);
-        t.BorderStyle = BorderStyle.FixedSingle;
-        t.ForeColor = TextDark;
-        t.RightToLeft = RightToLeft.No;
-        t.Margin = new Padding(4, 3, 4, 3);
+        textBox.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+        textBox.Font = new Font("Segoe UI", 11f);
+        textBox.BorderStyle = BorderStyle.FixedSingle;
+        textBox.ForeColor = TextDark;
+        textBox.RightToLeft = RightToLeft.No;
+        textBox.Margin = new Padding(4, 3, 4, 3);
     }
 
-    private static void StylePrimary(Button b, string text)
+    private static void StylePrimary(Button button, string text)
     {
-        b.Text = text;
-        b.Dock = DockStyle.Fill;
-        b.FlatStyle = FlatStyle.Flat;
-        b.FlatAppearance.BorderSize = 0;
-        b.FlatAppearance.MouseOverBackColor = AccentDark;
-        b.BackColor = Accent;
-        b.ForeColor = Color.White;
-        b.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
-        b.Cursor = Cursors.Hand;
-        b.Margin = new Padding(4, 3, 4, 3);
+        button.Text = text;
+        button.Dock = DockStyle.Fill;
+        button.FlatStyle = FlatStyle.Flat;
+        button.FlatAppearance.BorderSize = 0;
+        button.FlatAppearance.MouseOverBackColor = AccentDark;
+        button.BackColor = Accent;
+        button.ForeColor = Color.White;
+        button.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+        button.Cursor = Cursors.Hand;
+        button.Margin = new Padding(4, 3, 4, 3);
     }
 
     private static void OnEnter(KeyEventArgs e, Action action)
@@ -223,174 +295,632 @@ public class MainForm : Form
         action();
     }
 
-    private void SetStatus(string text) => statusLabel.Text = text;
-
-    // =====================================================================
-    //  ساخت WebView2؛ حالت InPrivate باید هنگام ساخت مشخص شود، پس با تغییر حالت دوباره ساخته می‌شود
-    // =====================================================================
-    private async Task InitWebViewAsync(bool inPrivate)
+    private void NormalizeRepetitionDigits()
     {
-        var old = webView;
-        var fresh = new WebView2 { Dock = DockStyle.Fill };
+        var original = repetitionCountBox.Text;
+        var normalized = new StringBuilder(original.Length);
+        foreach (var character in original)
+        {
+            if (character is >= '0' and <= '9')
+            {
+                normalized.Append(character);
+            }
+            else if (char.GetUnicodeCategory(character) == UnicodeCategory.DecimalDigitNumber)
+            {
+                normalized.Append((char)('0' + (int)char.GetNumericValue(character)));
+            }
+        }
 
-        var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync();
-        var options = env.CreateCoreWebView2ControllerOptions();
-        options.IsInPrivateModeEnabled = inPrivate;
+        var digits = normalized.ToString();
+        if (digits == original) return;
 
-        Controls.Add(fresh);
-        Controls.SetChildIndex(fresh, 0); // Fill باید آخر چیده شود
-        await fresh.EnsureCoreWebView2Async(env, options);
+        var cursor = repetitionCountBox.SelectionStart;
+        repetitionCountBox.Text = digits;
+        repetitionCountBox.SelectionStart = Math.Min(cursor, digits.Length);
+    }
 
-        webView = fresh;
-        if (old.Parent != null) { Controls.Remove(old); old.Dispose(); }
+    private void SetStatus(string text)
+    {
+        if (!IsDisposed && !Disposing)
+            statusLabel.Text = text;
+    }
+
+    private void SetInputControlsEnabled(bool enabled)
+    {
+        if (IsDisposed || Disposing) return;
+        keywordBox.Enabled = enabled;
+        siteBox.Enabled = enabled;
+        engineBox.Enabled = enabled;
+        repetitionCountBox.Enabled = enabled;
+        privateBox.Enabled = enabled;
+        proxyModeBox.Enabled = enabled && proxyPool.Count > 0;
+        fetchProxiesButton.Enabled = enabled && !proxyModeBox.Checked;
     }
 
     // =====================================================================
-    //  جستجو: کلمه + سایت هدف (رجکس). اگر سایت هدف خالی باشد فقط نتایج نمایش داده می‌شود.
+    //  راه‌اندازی برنامه و پارامترهای خط فرمان
     // =====================================================================
-    private async Task StartSearchAsync()
+    private async Task InitializeApplicationAsync()
     {
-        var keyword = keywordBox.Text.Trim();
-        var site = siteBox.Text.Trim();
-        if (keyword.Length == 0 || webView.CoreWebView2 == null || huntCts != null) return;
+        isInitializing = true;
+        SetInputControlsEnabled(false);
+        searchButton.Enabled = false;
 
-        var engine = Engines[engineBox.SelectedIndex];
-        var q = Uri.EscapeDataString(keyword);
-
-        // فقط جستجو
-        if (site.Length == 0)
+        var args = Environment.GetCommandLineArgs();
+        string? Arg(string name)
         {
-            SetStatus($"جستجوی «{keyword}» در {engine.Name}");
-            webView.CoreWebView2.Navigate(engine.PageUrl(q, 0));
-            return;
+            var index = Array.IndexOf(args, name);
+            return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
         }
 
-        try { _ = new System.Text.RegularExpressions.Regex(site); }
-        catch { SetStatus("سایت هدف (رجکس) معتبر نیست"); return; }
-
-        huntCts = new CancellationTokenSource();
-        var ct = huntCts.Token;
-        searchButton.Text = "توقف";
-        searchButton.BackColor = Danger;
-        searchButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(185, 28, 28);
+        var startPrivate = args.Contains("--private");
+        suppressToggle = true;
+        privateBox.Checked = startPrivate;
+        suppressToggle = false;
 
         try
         {
-            for (var page = 0; page < MaxPages; page++)
-            {
-                ct.ThrowIfCancellationRequested();
-                SetStatus($"جستجوی «{keyword}» — بررسی صفحه {page + 1}...");
-
-                if (page == 0 || engine.Name != "DuckDuckGo")
-                {
-                    if (!await NavigateAndWaitAsync(engine.PageUrl(q, page), ct))
-                    {
-                        SetStatus("بارگذاری صفحه نتایج ناموفق بود");
-                        return;
-                    }
-                }
-                else
-                {
-                    // DuckDuckGo صفحه‌بندی ندارد؛ دکمه «نتایج بیشتر» را می‌زنیم
-                    await webView.CoreWebView2.ExecuteScriptAsync(
-                        "document.querySelector('#more-results, button[id*=more]')?.click()");
-                }
-                await Task.Delay(1200, ct); // صبر برای رندر شدن نتایج
-
-                // قدم‌به‌قدم صفحه را پایین می‌رویم و در هر قدم نتایج را بررسی می‌کنیم
-                var found = new ScanResult(false, "", 0, null);
-                for (var step = 0; step < 15; step++)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    found = await ScanResultsAsync(site);
-                    if (found.Error != null) { SetStatus(found.Error); return; }
-                    if (found.Found) break;
-
-                    var atBottom = await webView.CoreWebView2.ExecuteScriptAsync(
-                        "(window.innerHeight + window.scrollY) >= document.documentElement.scrollHeight - 5");
-                    if (atBottom == "true") break;
-
-                    await webView.CoreWebView2.ExecuteScriptAsync(
-                        "window.scrollBy({top: Math.round(window.innerHeight * 0.4), behavior: 'smooth'})");
-                    await Task.Delay(700, ct);
-                }
-                if (!found.Found)
-                {
-                    var src = webView.Source?.ToString() ?? "";
-                    if (src.Contains("/sorry/") || src.Contains("captcha", StringComparison.OrdinalIgnoreCase))
-                    {
-                        SetStatus("موتور جستجو درخواست تایید هویت (کپچا) داد؛ جستجو متوقف شد");
-                        return;
-                    }
-                    if (found.Seen == 0)
-                    {
-                        SetStatus($"نتایج تمام شد؛ در {page + 1} صفحه سایتی مطابق «{site}» پیدا نشد");
-                        return;
-                    }
-                    continue;
-                }
-
-                SetStatus($"پیدا شد در صفحه {page + 1}: {found.Text}");
-                await webView.CoreWebView2.ExecuteScriptAsync(
-                    "document.querySelector('[data-mb-hit]')?.scrollIntoView({block:'center',behavior:'smooth'})");
-                await Task.Delay(900, ct);
-
-                // کلیک و صبر برای لود شدن سایت مقصد
-                var loaded = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                void OnLoaded(object? s, Microsoft.Web.WebView2.Core.CoreWebView2DOMContentLoadedEventArgs e) => loaded.TrySetResult(true);
-                webView.CoreWebView2.DOMContentLoaded += OnLoaded;
-                try
-                {
-                    await webView.CoreWebView2.ExecuteScriptAsync(
-                        "document.querySelector('[data-mb-hit]')?.click()");
-                    await Task.WhenAny(loaded.Task, Task.Delay(15000, ct));
-                }
-                finally { webView.CoreWebView2.DOMContentLoaded -= OnLoaded; }
-
-                SetStatus($"باز شد: {found.Text} — در حال مرور سایت...");
-                await BrowseSiteAsync(ct);
-                SetStatus($"باز شد: {found.Text}");
-                return;
-            }
-            SetStatus($"در {MaxPages} صفحه نتایج، سایتی مطابق «{site}» پیدا نشد");
+            await InitWebViewAsync(startPrivate);
         }
-        catch (OperationCanceledException)
+        catch (Exception ex)
         {
-            SetStatus("متوقف شد");
+            SetStatus($"راه‌اندازی مرورگر ناموفق بود: {ex.Message}");
+            return;
         }
         finally
         {
-            huntCts?.Dispose();
-            huntCts = null;
-            searchButton.Text = "جستجو و باز کردن";
-            searchButton.BackColor = Accent;
-            searchButton.FlatAppearance.MouseOverBackColor = AccentDark;
+            isInitializing = false;
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+                searchButton.Enabled = true;
         }
+
+        var repeatArgument = Arg("--repeat");
+        if (BigInteger.TryParse(repeatArgument, NumberStyles.None, CultureInfo.InvariantCulture, out var requestedCount) &&
+            requestedCount >= BigInteger.One)
+        {
+            repetitionCountBox.Text = requestedCount.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // اجرای خودکار از خط فرمان: MiniBrowser.exe --keyword اقیانوس --site wikipedia.org --repeat 3
+        var keyword = Arg("--keyword");
+        if (keyword != null)
+        {
+            keywordBox.Text = keyword;
+            siteBox.Text = Arg("--site") ?? "";
+            await StartSearchAsync();
+        }
+    }
+
+    // =====================================================================
+    //  تغییر حالت مرورگر
+    // =====================================================================
+    private async Task ChangePrivateModeAsync()
+    {
+        if (suppressToggle || isInitializing) return;
+        if (huntCts != null || isFetchingProxies)
+        {
+            suppressToggle = true;
+            privateBox.Checked = isPrivateMode;
+            suppressToggle = false;
+            return;
+        }
+
+        var requestedMode = privateBox.Checked;
+        var previousMode = isPrivateMode;
+        SetInputControlsEnabled(false);
+        searchButton.Enabled = false;
+        SetStatus(requestedMode ? "در حال فعال‌سازی حالت خصوصی..." : "در حال برگشت به حالت عادی...");
+
+        try
+        {
+            await InitWebViewAsync(
+                requestedMode,
+                resetCurrent: true,
+                proxyAddress: GetSelectedProxyAddress());
+            SetStatus(requestedMode ? "حالت خصوصی (InPrivate) فعال است" : "حالت عادی فعال است");
+        }
+        catch (Exception ex)
+        {
+            suppressToggle = true;
+            privateBox.Checked = previousMode;
+            suppressToggle = false;
+            SetStatus($"تغییر حالت مرورگر ناموفق بود: {ex.Message}");
+        }
+        finally
+        {
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+                searchButton.Enabled = true;
+        }
+    }
+
+    // =====================================================================
+    //  دریافت و مدیریت پروکسی‌ها
+    // =====================================================================
+    private async Task LoadAndTestProxiesAsync()
+    {
+        if (isFetchingProxies || huntCts != null || proxyModeBox.Checked) return;
+
+        isFetchingProxies = true;
+        SetInputControlsEnabled(false);
+        searchButton.Enabled = false;
+        SetStatus("در حال دریافت و آزمایش پروکسی‌های عمومی...");
+
+        try
+        {
+            var progress = new Progress<string>(message =>
+            {
+                if (IsDisposed || Disposing) return;
+                proxyStatusLabel.Text = message;
+                SetStatus(message);
+            });
+            var discovered = await proxyManager.FetchAndTestAsync(progress, CancellationToken.None);
+
+            if (discovered.Count == 0)
+            {
+                if (proxyPool.Count == 0)
+                {
+                    proxyStatusLabel.Text = "پروکسی قابل استفاده‌ای پیدا نشد";
+                    SetStatus("در نمونه‌ی دریافت‌شده پروکسی قابل استفاده‌ای پیدا نشد؛ بعداً دوباره امتحان کنید");
+                }
+                else
+                {
+                    proxyStatusLabel.Text = $"آزمایش جدید پروکسی موفق نبود؛ فهرست قبلی ({proxyPool.Count}) حفظ شد";
+                    SetStatus("پروکسی جدیدی پاسخ نداد؛ فهرست قبلی دست‌نخورده باقی ماند");
+                }
+                return;
+            }
+
+            proxyPool.Clear();
+            proxyPool.AddRange(discovered);
+            currentProxyIndex = 0;
+            searchesOnCurrentProxy = 0;
+            proxyStatusLabel.Text = $"{proxyPool.Count} پروکسی HTTPS سالم از TheSpeedX/GitHub؛ مرتب‌شده بر اساس سرعت";
+            SetStatus($"{proxyPool.Count} پروکسی از منبع عمومی دریافت و آزمایش شد");
+        }
+        catch (Exception ex)
+        {
+            proxyStatusLabel.Text = "دریافت یا آزمایش پروکسی ناموفق بود";
+            SetStatus($"دریافت یا آزمایش پروکسی ناموفق بود: {ex.Message}");
+        }
+        finally
+        {
+            isFetchingProxies = false;
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+                searchButton.Enabled = true;
+        }
+    }
+
+    private async Task ChangeProxyModeAsync()
+    {
+        if (suppressProxyToggle || isInitializing) return;
+
+        var requestedMode = proxyModeBox.Checked;
+        if (huntCts != null || isFetchingProxies)
+        {
+            suppressProxyToggle = true;
+            proxyModeBox.Checked = isProxyModeActive;
+            suppressProxyToggle = false;
+            return;
+        }
+        if (requestedMode && proxyPool.Count == 0)
+        {
+            suppressProxyToggle = true;
+            proxyModeBox.Checked = false;
+            suppressProxyToggle = false;
+            SetStatus("ابتدا «دریافت و بررسی» را بزنید تا پروکسی قابل استفاده پیدا شود");
+            return;
+        }
+
+        var previousMode = isProxyModeActive;
+        SetInputControlsEnabled(false);
+        searchButton.Enabled = false;
+        SetStatus(requestedMode ? "در حال فعال‌سازی پروکسی..." : "در حال غیرفعال‌سازی پروکسی...");
+
+        try
+        {
+            var address = requestedMode ? proxyPool[currentProxyIndex].Address : null;
+            await InitWebViewAsync(isPrivateMode, resetCurrent: true, proxyAddress: address);
+            isProxyModeActive = requestedMode;
+            if (requestedMode)
+                proxyStatusLabel.Text = $"فعال: {address} — تعویض خودکار هر {ProxyRotationInterval} جستجو";
+            else if (proxyPool.Count > 0)
+                proxyStatusLabel.Text = $"{proxyPool.Count} پروکسی سالم از TheSpeedX/GitHub؛ استفاده خاموش است";
+            SetStatus(requestedMode
+                ? $"پروکسی فعال شد: {address} — تعویض خودکار هر {ProxyRotationInterval} جستجو"
+                : "پروکسی غیرفعال شد؛ جستجو مستقیم انجام می‌شود");
+        }
+        catch (Exception ex)
+        {
+            suppressProxyToggle = true;
+            proxyModeBox.Checked = previousMode;
+            suppressProxyToggle = false;
+            SetStatus($"تغییر حالت پروکسی ناموفق بود: {ex.Message}");
+        }
+        finally
+        {
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+                searchButton.Enabled = true;
+        }
+    }
+
+    private string? GetSelectedProxyAddress() =>
+        isProxyModeActive && proxyPool.Count > 0
+            ? proxyPool[Math.Clamp(currentProxyIndex, 0, proxyPool.Count - 1)].Address
+            : null;
+
+    private static string GetProxyUserDataFolder(string proxyAddress)
+    {
+        var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(root)) root = Path.GetTempPath();
+        var profileName = proxyAddress.Replace(':', '_');
+        return Path.Combine(root, "MiniBrowser", "ProxyProfiles", profileName);
+    }
+
+    // =====================================================================
+    //  ساخت WebView2
+    // =====================================================================
+    private async Task InitWebViewAsync(bool inPrivate, bool resetCurrent = false, string? proxyAddress = null)
+    {
+        var old = webView;
+        if (resetCurrent)
+        {
+            // هنگام تعویض پروکسی یا ساخت نشست خصوصی تازه، کنترل قبلی بسته می‌شود.
+            DisposeWebView(old);
+            webView = null;
+            activeProxyAddress = null;
+        }
+
+        var fresh = new WebView2 { Dock = DockStyle.Fill };
+        try
+        {
+            var environmentOptions = new Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions();
+            string? userDataFolder = null;
+            if (proxyAddress != null)
+            {
+                environmentOptions.AdditionalBrowserArguments = $"--proxy-server=http://{proxyAddress}";
+                userDataFolder = GetProxyUserDataFolder(proxyAddress);
+                Directory.CreateDirectory(userDataFolder);
+            }
+
+            var environment = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(
+                null,
+                userDataFolder,
+                environmentOptions);
+            var options = environment.CreateCoreWebView2ControllerOptions();
+            options.IsInPrivateModeEnabled = inPrivate;
+
+            Controls.Add(fresh);
+            Controls.SetChildIndex(fresh, 0); // WebView باید تمام فضای باقی‌مانده را بگیرد
+            await fresh.EnsureCoreWebView2Async(environment, options);
+
+            webView = fresh;
+            isPrivateMode = inPrivate;
+            activeProxyAddress = proxyAddress;
+            if (!resetCurrent)
+                DisposeWebView(old);
+        }
+        catch
+        {
+            DisposeWebView(fresh);
+            if (resetCurrent)
+            {
+                webView = null;
+                activeProxyAddress = null;
+            }
+            throw;
+        }
+    }
+
+    private static void DisposeWebView(WebView2? view)
+    {
+        if (view == null || view.IsDisposed) return;
+        view.Parent?.Controls.Remove(view);
+        view.Dispose();
+    }
+
+    // =====================================================================
+    //  اجرای یک یا چند نوبت جستجو
+    // =====================================================================
+    private async Task StartSearchAsync()
+    {
+        if (huntCts != null || isFetchingProxies) return;
+
+        var keyword = keywordBox.Text.Trim();
+        var site = siteBox.Text.Trim();
+        if (keyword.Length == 0)
+        {
+            SetStatus("لطفاً کلمه جستجو را وارد کنید");
+            return;
+        }
+        if (!BigInteger.TryParse(repetitionCountBox.Text.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var repetitions) ||
+            repetitions < BigInteger.One)
+        {
+            SetStatus("تعداد تکرار باید یک عدد صحیح مثبت باشد");
+            return;
+        }
+        if (proxyModeBox.Checked && proxyPool.Count == 0)
+        {
+            SetStatus("حالت پروکسی فعال است اما پروکسی قابل استفاده‌ای وجود ندارد");
+            return;
+        }
+        if (webView?.CoreWebView2 == null)
+        {
+            SetStatus("مرورگر هنوز آماده نیست");
+            return;
+        }
+        if (engineBox.SelectedIndex < 0 || engineBox.SelectedIndex >= Engines.Length)
+        {
+            SetStatus("لطفاً یک موتور جستجو انتخاب کنید");
+            return;
+        }
+        if (site.Length > 0)
+        {
+            try { _ = new System.Text.RegularExpressions.Regex(site); }
+            catch (ArgumentException)
+            {
+                SetStatus("الگوی سایت هدف (رجکس) معتبر نیست");
+                return;
+            }
+        }
+
+        var engine = Engines[engineBox.SelectedIndex];
+        var usePrivateMode = privateBox.Checked;
+        var useProxy = proxyModeBox.Checked;
+        var cts = new CancellationTokenSource();
+        huntCts = cts;
+        var ct = cts.Token;
+        var completed = BigInteger.Zero;
+        var aborted = false;
+        var lastSummary = "";
+
+        SetInputControlsEnabled(false);
+        searchButton.Text = "توقف";
+        searchButton.BackColor = Danger;
+        searchButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(185, 28, 28);
+        searchButton.Enabled = true;
+
+        try
+        {
+            for (var attempt = BigInteger.One; attempt <= repetitions; attempt++)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (useProxy && searchesOnCurrentProxy >= ProxyRotationInterval)
+                {
+                    searchesOnCurrentProxy = 0;
+                    if (proxyPool.Count > 1)
+                    {
+                        currentProxyIndex = (currentProxyIndex + 1) % proxyPool.Count;
+                        var nextProxy = proxyPool[currentProxyIndex];
+                        proxyStatusLabel.Text = $"فعال: {nextProxy.Address} — تعویض در {ProxyRotationInterval} جستجوی بعدی";
+                        SetStatus($"در حال تعویض پروکسی به {nextProxy.Address} برای جستجوی {attempt} از {repetitions}...");
+                    }
+                    else
+                    {
+                        SetStatus("فقط یک پروکسی قابل استفاده است؛ همان پروکسی برای ادامه حفظ می‌شود");
+                    }
+                }
+
+                var requestedProxy = useProxy ? proxyPool[currentProxyIndex].Address : null;
+                var proxyChanged = !string.Equals(activeProxyAddress, requestedProxy, StringComparison.Ordinal);
+                if (usePrivateMode || proxyChanged)
+                {
+                    if (usePrivateMode)
+                        SetStatus($"در حال آماده‌سازی نشست خصوصی برای جستجوی {attempt} از {repetitions}...");
+                    else
+                        SetStatus(requestedProxy == null
+                            ? "در حال آماده‌سازی اتصال مستقیم..."
+                            : $"در حال آماده‌سازی اتصال از پروکسی {requestedProxy}...");
+                    await InitWebViewAsync(
+                        inPrivate: usePrivateMode,
+                        resetCurrent: true,
+                        proxyAddress: requestedProxy);
+                }
+                ct.ThrowIfCancellationRequested();
+
+                if (useProxy) searchesOnCurrentProxy++;
+                var result = await RunSearchAttemptAsync(keyword, site, engine, attempt, repetitions, ct);
+                ct.ThrowIfCancellationRequested();
+                completed = attempt;
+                lastSummary = result.Summary;
+                if (!result.ContinueBatch)
+                {
+                    aborted = true;
+                    break;
+                }
+            }
+
+            if (!aborted)
+                SetStatus($"تکمیل شد: {completed} از {repetitions} جستجو. {lastSummary}");
+        }
+        catch (OperationCanceledException)
+        {
+            SetStatus($"جستجو متوقف شد؛ {completed} از {repetitions} نوبت کامل شد");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"خطا در اجرای جستجو: {ex.Message}");
+        }
+        finally
+        {
+            if (ReferenceEquals(huntCts, cts))
+                huntCts = null;
+            cts.Dispose();
+
+            SetInputControlsEnabled(true);
+            if (!IsDisposed && !Disposing)
+            {
+                searchButton.Text = "جستجو و باز کردن";
+                searchButton.BackColor = Accent;
+                searchButton.FlatAppearance.MouseOverBackColor = AccentDark;
+                searchButton.Enabled = true;
+            }
+        }
+    }
+
+    private sealed record SearchAttemptResult(bool ContinueBatch, string Summary);
+
+    private async Task<SearchAttemptResult> RunSearchAttemptAsync(
+        string keyword,
+        string site,
+        Engine engine,
+        BigInteger attempt,
+        BigInteger repetitions,
+        CancellationToken ct)
+    {
+        var prefix = $"جستجوی {attempt} از {repetitions}";
+        var query = Uri.EscapeDataString(keyword);
+        var core = webView?.CoreWebView2;
+        if (core == null)
+        {
+            var unavailable = $"{prefix}: مرورگر آماده نیست";
+            SetStatus(unavailable);
+            return new SearchAttemptResult(false, unavailable);
+        }
+
+        if (site.Length == 0)
+        {
+            SetStatus($"{prefix}: جستجوی «{keyword}» در {engine.Name}...");
+            var loaded = await NavigateAndWaitAsync(engine.PageUrl(query, 0), ct);
+            var summary = loaded
+                ? $"جستجوی «{keyword}» در {engine.Name} باز شد"
+                : "بارگذاری صفحه نتایج ناموفق بود";
+            SetStatus($"{prefix}: {summary}");
+            return new SearchAttemptResult(true, summary);
+        }
+
+        for (var page = 0; page < MaxPages; page++)
+        {
+            ct.ThrowIfCancellationRequested();
+            SetStatus($"{prefix} — «{keyword}» — بررسی صفحه {page + 1}...");
+
+            if (page == 0 || engine.Name != "DuckDuckGo")
+            {
+                if (!await NavigateAndWaitAsync(engine.PageUrl(query, page), ct))
+                {
+                    var loadFailure = $"{prefix}: بارگذاری صفحه نتایج ناموفق بود";
+                    SetStatus(loadFailure);
+                    return new SearchAttemptResult(true, loadFailure);
+                }
+            }
+            else
+            {
+                // DuckDuckGo صفحه‌بندی معمولی ندارد؛ دکمه «نتایج بیشتر» را می‌زنیم.
+                await core.ExecuteScriptAsync("document.querySelector('#more-results, button[id*=more]')?.click()");
+            }
+
+            await Task.Delay(1200, ct); // صبر برای رندر شدن نتایج
+
+            // قدم‌به‌قدم صفحه را پایین می‌رویم و در هر قدم نتایج را بررسی می‌کنیم.
+            var found = new ScanResult(false, "", "", 0, null);
+            for (var step = 0; step < 15; step++)
+            {
+                ct.ThrowIfCancellationRequested();
+                found = await ScanResultsAsync(site);
+                if (found.Error != null)
+                {
+                    var scanFailure = $"{prefix}: {found.Error}";
+                    SetStatus(scanFailure);
+                    return new SearchAttemptResult(false, scanFailure);
+                }
+                if (found.Found) break;
+
+                var atBottom = await core.ExecuteScriptAsync(
+                    "(window.innerHeight + window.scrollY) >= document.documentElement.scrollHeight - 5");
+                if (atBottom == "true") break;
+
+                await core.ExecuteScriptAsync(
+                    "window.scrollBy({top: Math.round(window.innerHeight * 0.4), behavior: 'smooth'})");
+                await Task.Delay(700, ct);
+            }
+
+            if (!found.Found)
+            {
+                var source = webView?.Source?.ToString() ?? "";
+                if (source.Contains("/sorry/") || source.Contains("captcha", StringComparison.OrdinalIgnoreCase))
+                {
+                    var captcha = "موتور جستجو درخواست تایید هویت (کپچا) داد؛ تکرار جستجو متوقف شد";
+                    SetStatus($"{prefix}: {captcha}");
+                    return new SearchAttemptResult(false, captcha);
+                }
+                if (found.Seen == 0)
+                {
+                    var noResults = $"در صفحه {page + 1} نتیجه قابل‌خواندن پیدا نشد";
+                    SetStatus($"{prefix}: {noResults}");
+                    return new SearchAttemptResult(true, noResults);
+                }
+                continue;
+            }
+
+            SetStatus($"{prefix}: سایت هدف در صفحه {page + 1} پیدا شد — {found.Text}");
+            await core.ExecuteScriptAsync(
+                "document.querySelector('[data-mb-hit]')?.scrollIntoView({block:'center',behavior:'smooth'})");
+            await Task.Delay(900, ct);
+
+            if (!Uri.TryCreate(found.Url, UriKind.Absolute, out var targetUri) ||
+                (targetUri.Scheme != Uri.UriSchemeHttp && targetUri.Scheme != Uri.UriSchemeHttps))
+            {
+                var invalidTarget = "نشانی نتیجه پیدا شد، اما قابل باز کردن نیست";
+                SetStatus($"{prefix}: {invalidTarget}");
+                return new SearchAttemptResult(true, invalidTarget);
+            }
+
+            // رفتن مستقیم به href، پنجره‌های جدید احتمالی موتور جستجو را هم دور می‌زند.
+            if (!await NavigateAndWaitAsync(targetUri.ToString(), ct))
+            {
+                var targetFailure = $"بارگذاری سایت پیدا‌شده ناموفق بود: {found.Text}";
+                SetStatus($"{prefix}: {targetFailure}");
+                return new SearchAttemptResult(true, targetFailure);
+            }
+
+            SetStatus($"{prefix}: باز شد — {found.Text} — در حال مرور سایت...");
+            await BrowseSiteAsync(ct);
+            var opened = $"سایت مطابق «{site}» باز شد: {found.Text}";
+            SetStatus($"{prefix}: {opened}");
+            return new SearchAttemptResult(true, opened);
+        }
+
+        var exhausted = $"در {MaxPages} صفحه، سایتی مطابق «{site}» پیدا نشد";
+        SetStatus($"{prefix}: {exhausted}");
+        return new SearchAttemptResult(true, exhausted);
     }
 
     private async Task<bool> NavigateAndWaitAsync(string url, CancellationToken ct)
     {
-        var core = webView.CoreWebView2;
-        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        // DOMContentLoaded زودتر از NavigationCompleted می‌آید (گوگل تا چند ثانیه منابع جانبی لود می‌کند)
-        void Handler(object? s, Microsoft.Web.WebView2.Core.CoreWebView2DOMContentLoadedEventArgs e) =>
-            tcs.TrySetResult(true);
+        var core = webView?.CoreWebView2;
+        if (core == null) return false;
+
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // DOMContentLoaded زودتر از NavigationCompleted می‌آید؛ موتور ممکن است منابع جانبی را دیرتر لود کند.
+        void Handler(object? sender, Microsoft.Web.WebView2.Core.CoreWebView2DOMContentLoadedEventArgs e) =>
+            completion.TrySetResult(true);
 
         core.DOMContentLoaded += Handler;
         try
         {
             core.Navigate(url);
-            using var reg = ct.Register(() => tcs.TrySetCanceled());
-            var done = await Task.WhenAny(tcs.Task, Task.Delay(20000, ct));
-            return done == tcs.Task && await tcs.Task;
+            using var registration = ct.Register(() => completion.TrySetCanceled(ct));
+            var finished = await Task.WhenAny(completion.Task, Task.Delay(20000, ct));
+            ct.ThrowIfCancellationRequested();
+            if (finished != completion.Task) return false;
+            return await completion.Task;
         }
-        finally { core.DOMContentLoaded -= Handler; }
+        finally
+        {
+            core.DOMContentLoaded -= Handler;
+        }
     }
 
-        // بعد از ورود به سایت: کمی پایین و سپس بالا اسکرول می‌کند
+    // بعد از ورود به سایت: کمی پایین و سپس بالا اسکرول می‌کند.
     private async Task BrowseSiteAsync(CancellationToken ct)
     {
-        var core = webView.CoreWebView2;
+        var core = webView?.CoreWebView2;
+        if (core == null) return;
+
         await Task.Delay(1500, ct);
         for (var i = 0; i < 8; i++)
         {
@@ -410,16 +940,20 @@ public class MainForm : Form
         }
     }
 
-    private sealed record ScanResult(bool Found, string Text, int Seen, string? Error);
+    private sealed record ScanResult(bool Found, string Text, string Url, int Seen, string? Error);
 
-    // نتیجه‌ای را پیدا می‌کند که آدرس نمایش‌داده‌شده‌اش با رجکس بخواند
+    // نتیجه‌ای را پیدا می‌کند که آدرس نمایش‌داده‌شده‌اش با رجکس بخواند.
     private async Task<ScanResult> ScanResultsAsync(string pattern)
     {
-        var js = """
+        var core = webView?.CoreWebView2;
+        if (core == null)
+            return new ScanResult(false, "", "", 0, "مرورگر آماده نیست");
+
+        var script = """
         (() => {
-          let re; try { re = new RegExp(__PATTERN__, 'i'); } catch (e) { return { error: 'رجکس نامعتبر است' }; }
+          let re; try { re = new RegExp(__PATTERN__, 'i'); } catch (e) { return { error: 'الگوی رجکس نامعتبر است' }; }
           const engineHost = /(^|\.)(google|bing|duckduckgo)\./i;
-          let hit = null, text = '', seen = 0;
+          let hit = null, text = '', targetUrl = '', seen = 0;
           for (const a of document.querySelectorAll('a[href]')) {
             let u; try { u = new URL(a.href); } catch (e) { continue; }
             if (!/^https?:$/.test(u.protocol)) continue;
@@ -428,18 +962,25 @@ public class MainForm : Form
             else { const c = a.querySelector('cite'); if (c) probe = c.parentElement.innerText || c.innerText; }
             if (!probe) continue;
             seen++;
-            if (re.test(probe)) { hit = a; text = probe.replace(/\s+/g, ' ').trim(); break; }
+            if (re.test(probe)) { hit = a; text = probe.replace(/\s+/g, ' ').trim(); targetUrl = u.href; break; }
           }
           document.querySelectorAll('[data-mb-hit]').forEach(e => e.removeAttribute('data-mb-hit'));
           if (hit) hit.setAttribute('data-mb-hit', '1');
-          return { found: !!hit, text, seen };
+          return { found: !!hit, text, url: targetUrl, seen };
         })()
         """.Replace("__PATTERN__", JsonSerializer.Serialize(pattern));
 
-        var raw = await webView.CoreWebView2.ExecuteScriptAsync(js);
-        using var doc = JsonDocument.Parse(raw);
-        var root = doc.RootElement;
-        if (root.TryGetProperty("error", out var err)) return new ScanResult(false, "", 0, err.GetString());
-        return new ScanResult(root.GetProperty("found").GetBoolean(), root.GetProperty("text").GetString() ?? "", root.GetProperty("seen").GetInt32(), null);
+        var raw = await core.ExecuteScriptAsync(script);
+        using var document = JsonDocument.Parse(raw);
+        var root = document.RootElement;
+        if (root.TryGetProperty("error", out var error))
+            return new ScanResult(false, "", "", 0, error.GetString());
+
+        return new ScanResult(
+            root.GetProperty("found").GetBoolean(),
+            root.GetProperty("text").GetString() ?? "",
+            root.GetProperty("url").GetString() ?? "",
+            root.GetProperty("seen").GetInt32(),
+            null);
     }
 }
