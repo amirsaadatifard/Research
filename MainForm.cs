@@ -1070,6 +1070,7 @@ public class MainForm : Form
           const queryTerms = normalize(query).split(' ').filter(term => term.length > 1);
           const seen = new Set(), candidates = [];
           for (const anchor of document.querySelectorAll('a[href]')) {
+            if (!productOnly && isGoogle(location.hostname) && !anchor.querySelector('h3')) continue;
             const url = unwrap(anchor.href);
             if (!url || !/^https?:$/.test(url.protocol) || !isTorob(url.hostname) ||
                 url.hostname.toLowerCase() === 'api.torob.com') continue;
@@ -1089,8 +1090,10 @@ public class MainForm : Form
               (productOnly && /^\/(p|product)\//.test(path) ? 20 : 0);
             candidates.push({ url: url.href, context, score });
           }
-          candidates.sort((left, right) => right.score - left.score);
-          return { candidates: candidates.slice(0, __LIMIT__) };
+          if (productOnly) candidates.sort((left, right) => right.score - left.score);
+          // از Google فقط اولین نتیجهٔ اصلی Torob باز می‌شود؛ در جستجوی داخلی Torob چند محصول رتبه‌بندی می‌شوند.
+          const limit = productOnly ? __LIMIT__ : 1;
+          return { candidates: candidates.slice(0, limit) };
         })()
         """.Replace("__QUERY__", JsonSerializer.Serialize(productQuery))
            .Replace("__PRODUCT_ONLY__", productOnly ? "true" : "false")
