@@ -876,7 +876,11 @@ public class MainForm : Form
 
         var candidates = await FindTorobProductCandidatesAsync(productQuery);
         if (candidates.Count == 0)
-            return new TorobAttemptResult(false, false, "در نتایج Google پیوند محصولی از Torob پیدا نشد.");
+        {
+            // اگر ساختار نتایج Google عوض شده باشد، سایت Torob را مستقیم باز می‌کنیم و آنجا جستجو می‌کنیم.
+            SetStatus("پیوند Torob در نتایج خوانده نشد؛ سایت Torob را باز می‌کنم...");
+            candidates = new[] { new TorobSearchCandidate("https://torob.com/", "", 0) };
+        }
 
         var sawMatchingProduct = false;
         var sellerLinkMissing = false;
@@ -1070,9 +1074,9 @@ public class MainForm : Form
             if (!url || !/^https?:$/.test(url.protocol) || !isTorob(url.hostname) ||
                 url.hostname.toLowerCase() === 'api.torob.com') continue;
             const path = url.pathname.toLowerCase();
-            if (path === '/' || /^\/(v4|search|category|categories|shop|shops|brand|brands|blog|about|product-page)(\/|$)/.test(path)) continue;
+            if (/^\/(v4|product-page)(\/|$)/.test(path)) continue;
             if (url.origin === location.origin && path === location.pathname.toLowerCase()) continue;
-            if (productOnly && /^\/browse(?:_|\/|$)/.test(path)) continue;
+            if (productOnly && (path === '/' || path.startsWith('/browse_') || /^\/(browse|search|category|categories|shop|shops|brand|brands|blog|about)(\/|$)/.test(path))) continue;
             const key = url.origin + url.pathname;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -1228,7 +1232,7 @@ public class MainForm : Form
         if (!string.Equals(raw.Trim(), "true", StringComparison.Ordinal))
             return await NavigateAndWaitAsync(targetUrl, ct);
 
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(25);
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
         while (DateTime.UtcNow < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -1251,7 +1255,8 @@ public class MainForm : Form
             await Task.Delay(200, ct);
         }
 
-        return false;
+        // اگر رویداد کلیک توسط سایت رهگیری نشد، همان href زنده را مستقیم در WebView باز می‌کنیم.
+        return await NavigateAndWaitAsync(targetUrl, ct);
     }
 
     private async Task<bool> WaitForExternalSellerLandingAsync(CancellationToken ct)
