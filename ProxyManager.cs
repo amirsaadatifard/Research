@@ -15,11 +15,15 @@ internal sealed class ProxyManager
     // فهرست عمومی HTTP proxyها؛ endpoint از API گیت‌هاب به صورت Base64 دریافت می‌شود.
     public const string SourceUrl = "https://api.github.com/repos/TheSpeedX/PROXY-List/contents/http.txt";
 
-    private const string TestUrl = "https://example.com/";
+    private static readonly Uri[] TestUrls =
+    {
+        new("https://www.google.com/"),
+        new("https://torob.com/"),
+    };
     private const int MaxCandidatesToTest = 60;
     private const int MaxConcurrentTests = 10;
     private static readonly TimeSpan SourceTimeout = TimeSpan.FromSeconds(20);
-    private static readonly TimeSpan ProxyTimeout = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan ProxyTimeout = TimeSpan.FromSeconds(6);
 
     public async Task<IReadOnlyList<ProxyEndpoint>> FetchAndTestAsync(
         IProgress<string>? progress,
@@ -139,23 +143,24 @@ internal sealed class ProxyManager
             client.DefaultRequestHeaders.UserAgent.ParseAdd("MiniBrowser/1.0");
 
             var stopwatch = Stopwatch.StartNew();
-            using var response = await client.GetAsync(
-                TestUrl,
-                HttpCompletionOption.ResponseHeadersRead,
-                cancellationToken);
-            if (!response.IsSuccessStatusCode ||
-                !string.Equals(response.RequestMessage?.RequestUri?.Host, "example.com", StringComparison.OrdinalIgnoreCase))
-                return null;
-
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
-            if (!body.Contains("Example Domain", StringComparison.OrdinalIgnoreCase)) return null;
+            foreach (var testUrl in TestUrls)
+            {
+                using var response = await client.GetAsync(
+                    testUrl,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+                var finalUri = response.RequestMessage?.RequestUri;
+                if (!response.IsSuccessStatusCode || finalUri == null ||
+                    !IsExpectedTestHost(testUrl.Host, finalUri.Host))
+                    return null;
+            }
 
             stopwatch.Stop();
             return new ProxyEndpoint(address, (int)stopwatch.ElapsedMilliseconds);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            // timeout پروکسی مرده یا کند را از فهرست حذف می‌کند.
+            // Timeout یکی از مقصدهای واقعی گردش‌کار، پروکسی را نامناسب می‌کند.
             return null;
         }
         catch (HttpRequestException)
@@ -174,5 +179,18 @@ internal sealed class ProxyManager
         {
             return null;
         }
+    }
+
+    private static bool IsExpectedTestHost(string requestedHost, string finalHost)
+    {
+        if (requestedHost.EndsWith("google.com", StringComparison.OrdinalIgnoreCase))
+            return finalHost.Equals("google.com", StringComparison.OrdinalIgnoreCase) ||
+                   finalHost.EndsWith(".google.com", StringComparison.OrdinalIgnoreCase);
+
+        if (requestedHost.EndsWith("torob.com", StringComparison.OrdinalIgnoreCase))
+            return finalHost.Equals("torob.com", StringComparison.OrdinalIgnoreCase) ||
+                   finalHost.EndsWith(".torob.com", StringComparison.OrdinalIgnoreCase);
+
+        return false;
     }
 }
